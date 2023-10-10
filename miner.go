@@ -4,15 +4,21 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/crypto/blake256"
+	"github.com/decred/dcrd/rpcclient/v8"
 	"github.com/decred/gominer/stratum"
+	"github.com/decred/gominer/util"
 	"github.com/decred/gominer/work"
 )
 
@@ -28,29 +34,98 @@ type Miner struct {
 	needsWorkRefresh chan struct{}
 	wg               sync.WaitGroup
 	pool             *stratum.Stratum
+
+	rpc *rpcclient.Client
 }
 
-func NewMiner() (*Miner, error) {
+func newStratum() (*Miner, error) {
+	s, err := stratum.StratumConn(cfg.Pool, cfg.PoolUser, cfg.PoolPassword, cfg.Proxy, cfg.ProxyUser, cfg.ProxyPass, version(), chainParams)
+	if err != nil {
+		return nil, err
+	}
 	m := &Miner{
+		pool:             s,
 		workDone:         make(chan []byte, 10),
 		needsWorkRefresh: make(chan struct{}),
 	}
+	return m, nil
+}
 
-	// If needed, start pool code.
-	if cfg.Pool != "" && !cfg.Benchmark {
-		s, err := stratum.StratumConn(cfg.Pool, cfg.PoolUser, cfg.PoolPassword,
-			cfg.Proxy, cfg.ProxyUser, cfg.ProxyPass, version(), chainParams)
-		if err != nil {
-			return nil, err
-		}
-		m.pool = s
+func newMiner(ctx context.Context) (*Miner, error) {
+	var rpc *rpcclient.Client
+	ntfnHandlers := rpcclient.NotificationHandlers{
+		OnBlockConnected: func(blockHeader []byte, transactions [][]byte) {
+			minrLog.Infof("Block connected: %x (%d transactions)", blockHeader, len(transactions))
+		},
+		OnBlockDisconnected: func(blockHeader []byte) {
+			minrLog.Infof("Block disconnected: %x", blockHeader)
+		},
+		OnWork: func(data, target []byte, reason string) {
+			minrLog.Infof("Work received: %x %x %s", data, target, reason)
+
+			bigTarget := new(big.Int)
+			bigTarget.SetBytes(util.Reverse(target))
+
+			var workData [192]byte
+			copy(workData[:], data)
+			ts := workData[128+4*work.TimestampWord : 132+4*work.TimestampWord]
+			givenTs := binary.LittleEndian.Uint32(ts)
+			w := work.NewWork(workData, bigTarget, givenTs, uint32(time.Now().Unix()), true)
+
+			w.Target = bigTarget
+
+			// Solo
+			for _, d := range m.devices {
+				d.SetWork(ctx, w)
+			}
+		},
+	}
+	// Connect to local dcrd RPC server using websockets.
+	certs, err := os.ReadFile(cfg.RPCCert)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read rpc certificate %v: %w",
+			cfg.RPCCert, err)
+	}
+
+	connCfg := &rpcclient.ConnConfig{
+		Host:         cfg.RPCServer,
+		Endpoint:     "ws",
+		User:         cfg.RPCUser,
+		Pass:         cfg.RPCPassword,
+		Certificates: certs,
+		Proxy:        cfg.Proxy,
+		ProxyUser:    cfg.ProxyUser,
+		ProxyPass:    cfg.ProxyPass,
+	}
+	rpc, err = rpcclient.New(connCfg, &ntfnHandlers)
+	if err != nil {
+		return nil, err
+	}
+
+	m := &Miner{
+		rpc:      rpc,
+		workDone: make(chan []byte, 10),
+	}
+
+	return m, nil
+}
+
+func NewMiner(ctx context.Context) (*Miner, error) {
+	var m *Miner
+	var err error
+	if cfg.Pool == "" {
+		m, err = newMiner(ctx)
+	} else {
+		m, err = newStratum()
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	m, deviceListEnabledCount, err := newMinerDevs(m)
 	if err != nil {
 		return nil, err
 	}
-
 	if deviceListEnabledCount == 0 {
 		return nil, fmt.Errorf("no devices started")
 	}
@@ -70,24 +145,20 @@ func (m *Miner) workSubmitThread(ctx context.Context) {
 		case data := <-m.workDone:
 			// Only use that is we are not using a pool.
 			if m.pool == nil {
-				accepted, err := GetWorkSubmit(data)
+				// Solo
+				accepted, err := m.rpc.GetWorkSubmit(ctx, hex.EncodeToString(data))
 				if err != nil {
 					atomic.AddUint64(&m.invalidShares, 1)
-					minrLog.Errorf("Error submitting work: %v", err)
-				} else {
-					if accepted {
-						atomic.AddUint64(&m.validShares, 1)
-						minrLog.Infof("Submitted work successfully: block hash %v",
-							chainhash.Hash(blake256.Sum256(data[:180])))
-					} else {
-						atomic.AddUint64(&m.invalidShares, 1)
-					}
-
-					select {
-					case m.needsWorkRefresh <- struct{}{}:
-					case <-ctx.Done():
-					}
+					minrLog.Errorf("failed to submit work: %w", err)
+					continue
+				} else if !accepted {
+					atomic.AddUint64(&m.invalidShares, 1)
+					minrLog.Error("work not accepted")
+					continue
 				}
+				atomic.AddUint64(&m.validShares, 1)
+				minrLog.Infof("Submitted work successfully: block hash %v",
+					chainhash.Hash(blake256.Sum256(data[:180])))
 			} else {
 				submitted, err := GetPoolWorkSubmit(data, m.pool)
 				if err != nil {
@@ -123,32 +194,22 @@ func (m *Miner) workRefreshThread(ctx context.Context) {
 	defer t.Stop()
 
 	for {
-		// Only use that is we are not using a pool.
-		if m.pool == nil {
-			work, err := GetWork()
+		// Stratum only code.
+		m.pool.Lock()
+		if m.pool.PoolWork.NewWork {
+			work, err := GetPoolWork(m.pool)
+			m.pool.Unlock()
 			if err != nil {
-				minrLog.Errorf("Error in getwork: %v", err)
+				minrLog.Errorf("Error in getpoolwork: %v", err)
 			} else {
 				for _, d := range m.devices {
 					d.SetWork(ctx, work)
 				}
 			}
 		} else {
-			m.pool.Lock()
-			if m.pool.PoolWork.NewWork {
-				work, err := GetPoolWork(m.pool)
-				m.pool.Unlock()
-				if err != nil {
-					minrLog.Errorf("Error in getpoolwork: %v", err)
-				} else {
-					for _, d := range m.devices {
-						d.SetWork(ctx, work)
-					}
-				}
-			} else {
-				m.pool.Unlock()
-			}
+			m.pool.Unlock()
 		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -226,7 +287,7 @@ func (m *Miner) Run(ctx context.Context) {
 		for _, d := range m.devices {
 			d.SetWork(ctx, work)
 		}
-	} else {
+	} else if m.pool != nil {
 		m.wg.Add(1)
 		go m.workRefreshThread(ctx)
 	}
