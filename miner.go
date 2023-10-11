@@ -39,8 +39,9 @@ type Miner struct {
 }
 
 func newStratum() (*Miner, error) {
+	clientVersion := fmt.Sprintf("%d.%d.%d", Major, Minor, Patch)
 	s, err := stratum.StratumConn(cfg.Pool, cfg.PoolUser, cfg.PoolPassword,
-		cfg.Proxy, cfg.ProxyUser, cfg.ProxyPass, Version, chainParams)
+		cfg.Proxy, cfg.ProxyUser, cfg.ProxyPass, clientVersion, chainParams)
 	if err != nil {
 		return nil, err
 	}
